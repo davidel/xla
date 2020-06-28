@@ -2,7 +2,6 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-import contextlib
 import os
 import re
 import socket
@@ -11,6 +10,7 @@ import torch.multiprocessing
 import torch_xla
 import torch_xla.core.xla_env_vars as xenv
 import torch_xla.core.xla_model as xm
+import torch_xla.utils.utils as xu
 import traceback
 
 PreForkConfig = collections.namedtuple('PreForkConfig', 'dev_kind num_devices')
@@ -19,16 +19,6 @@ WorkerConfigEntry = collections.namedtuple('WorkerConfigEntry',
 
 _LOCAL_WORKER = 'localservice'
 _CUDA_VISIBLE_DEVICES = 'CUDA_VISIBLE_DEVICES'
-
-
-def _get_free_tcp_ports(n=1):
-  ports = []
-  for _ in range(0, n):
-    with contextlib.closing(socket.socket(socket.AF_INET,
-                                          socket.SOCK_STREAM)) as s:
-      s.bind(('', 0))
-      ports.append(s.getsockname()[1])
-  return ports
 
 
 def _is_xla_config():
@@ -97,6 +87,9 @@ def _get_multiprocessing_device():
 
 
 def _get_local_worker_index():
+  host_ordinal = os.environ.get(xenv.HOST_ORDINAL, None)
+  if host_ordinal is not None:
+    return int(host_ordinal)
   worker = os.environ.get(xenv.LOCAL_WORKER, None)
   if worker is None:
     return 0
@@ -110,11 +103,24 @@ def _local_index_to_global(index, num_devices):
   return _get_local_worker_index() * num_devices + index
 
 
+def _setup_torch_distributed():
+  import torch.distributed as dist
+
+  ordinal = int(os.environ[xenv.HOST_ORDINAL])
+  world_size = int(os.environ[xenv.HOST_WORLD_SIZE])
+  method = os.environ.get(xenv.TORCH_DIST_METHOD, 'gloo')
+  init_method = 'tcp://{}'.format(os.environ[xenv.TORCH_DIST_ROOT])
+  dist.init_process_group(
+      method, init_method=init_method, rank=ordinal, world_size=world_size)
+
+
 def _setup_world_size(num_devices):
   # We cannot call into xla_model code at this point, as we do not know whether
   # the called code would trigger XLA library initializations (which we must
   # not do at this point). So we avoid calling into xm.xrt_world_size().
-  world_size = _get_world_size() * num_devices
+  host_world_size = _get_world_size()
+  world_size = host_world_size * num_devices
+  os.environ[xenv.HOST_WORLD_SIZE] = str(host_world_size)
   os.environ[xenv.WORLD_SIZE] = str(world_size)
 
 
@@ -141,7 +147,7 @@ def _setup_workers(num_devices):
     assert world_size == 1, ('Cannot use more than one host without {} '
                              'configuration: {}').format(
                                  xenv.WORKERS, world_size)
-    ports = _get_free_tcp_ports(num_devices)
+    ports = xu.get_free_tcp_ports(num_devices)
     host = socket.getfqdn()
     for wid in range(0, num_devices):
       workers.append('{}:{};grpc://{}:{}'.format(_LOCAL_WORKER, wid, host,
@@ -160,8 +166,9 @@ def _pre_fork_setup(num_devices):
   if num_devices > 1 and not os.environ.get(xenv.SERVICE_ADDRESS, None):
     # In multi-processing mode, even if there is only one XLA host, we still
     # bring up the mesh service.
-    os.environ[xenv.SERVICE_ADDRESS] = '{}:{}'.format(socket.getfqdn(),
-                                                      _get_free_tcp_ports()[0])
+    os.environ[xenv.SERVICE_ADDRESS] = '{}:{}'.format(
+        socket.getfqdn(),
+        xu.get_free_tcp_ports()[0])
   if dev_kind == 'GPU':
     _setup_workers(num_devices)
     _create_gpu_devices(num_devices)
@@ -180,17 +187,24 @@ def _setup_gpu_worker(index, gindex, pf_cfg):
   os.environ.pop(xenv.GPU_NUM_DEVICES, None)
 
 
+def _wants_tpu_env_config(index, gindex):
+  if xenv.HOST_ORDINAL in os.environ:
+    return index == 0
+  return gindex == 0
+
+
 def _setup_tpu_worker(index, gindex, pf_cfg, tpu_env_config):
   os.environ[xenv.MP_DEVICE] = 'TPU:{}'.format(gindex)
   if xenv.LOCAL_WORKER not in os.environ:
     # The local worker can be missing for a 1 TPU host setup. Make sure we
     # always have one.
-    assert tpu_env_config is not None, 'tpu_env_config must not be None'
+    assert tpu_env_config, '{} environment must be populated'.format(
+        xenv.TPU_CONFIG)
     tpu_config = _parse_tpu_config(tpu_env_config)
     worker = list(tpu_config.values())[0]
     os.environ[xenv.LOCAL_WORKER] = '{}:{}'.format(worker.worker_name,
                                                    worker.ordinal)
-  if gindex > 0:
+  if not _wants_tpu_env_config(index, gindex):
     # In multi-processing mode, only the process handling the first device of
     # the master worker, will do TPU mesh initialization, so we need to remove
     # the environment configs which would prevent the client to be falling in
@@ -208,6 +222,20 @@ def _prepare_env_for_index(index, pf_cfg):
   if pf_cfg.dev_kind == 'TPU':
     _setup_tpu_worker(index, gindex, pf_cfg,
                       os.environ.get(xenv.TPU_CONFIG, None))
+    if xenv.HOST_ORDINAL in os.environ and index == 0:
+      # If xenv.HOST_ORDINAL is set, we are in a sea-of-devices TPU setup, where
+      # each host has local TPU devices, but not interconnected with the fast TPU
+      # link. In this case each TPU host sees only local TPU devices, as far as
+      # fast TPU reduction goes, and global redcutions are performed with normal
+      # torch.distributed facilities. The ordinal 0 of each TPU host will be the
+      # one performing the global reductions.
+      # Sea of devices configuration:
+      #  - xenv.HOST_ORDINAL must be set to the host ordinal.
+      #  - xenv.TORCH_DIST_ROOT must be set to the HOST:PORT, where HOST is the
+      #    master.
+      #  - The worker ordinal in the xenv.LOCAL_WORKER must be set to 0 in all
+      #    hosts.
+      _setup_torch_distributed()
   elif pf_cfg.dev_kind == 'GPU':
     _setup_gpu_worker(index, gindex, pf_cfg)
   return gindex
